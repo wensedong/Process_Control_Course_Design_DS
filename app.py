@@ -39,6 +39,7 @@ from tuning_methods import (
 )
 from data_export import save_figure, save_csv, _get_default_dir, _timestamp
 from fuzzy_pid import FuzzyPIDController
+from rl_tuner import rl_tune
 
 
 # ============================================================
@@ -206,7 +207,7 @@ class PidTunerApp:
             row=0, column=0, sticky='e', padx=(0, 4))
         method_cb = ttk.Combobox(tunef, textvariable=self.tuning_method, width=16,
                                  values=['手动经验法', '临界比例带法', '衰减曲线法', '响应曲线法',
-                                         '模糊PID控制'],
+                                         '模糊PID控制', '强化学习整定'],
                                  state='readonly')
         method_cb.grid(row=0, column=1, columnspan=2, pady=2)
         method_cb.bind('<<ComboboxSelected>>', lambda e: self.on_method_change())
@@ -431,6 +432,11 @@ class PidTunerApp:
             self.lbl_recommend.config(
                 text='拖动PID滑块设置基础参数, 模糊控制器会自动在线调整',
                 fg=COLOR_PRIMARY)
+        elif method == '强化学习整定':
+            self.btn_tune.config(text='开始训练')
+            self.lbl_recommend.config(
+                text='Q-Learning自动探索最优PID参数 (约200轮仿真)',
+                fg=COLOR_MUTED)
 
     def set_preset(self, preset_type):
         presets = {
@@ -474,6 +480,8 @@ class PidTunerApp:
         elif method == '模糊PID控制':
             # 模糊PID不需要"执行整定" — 已经在 update_plot 中自动激活
             self.update_plot()
+        elif method == '强化学习整定':
+            self._run_rl_tuning(K, T, tau)
 
     def _run_critical_manual(self, K, T, tau, law):
         from tuning_methods import manual_critical_measure
@@ -580,6 +588,53 @@ class PidTunerApp:
             text=f"ε={params['epsilon']:.4f} τ/T={params['tau_T_ratio']:.2f} → "
                  f"Kp={params['Kp']:.2f} Ki={params['Ki']:.2f} Kd={params['Kd']:.2f}",
             fg=COLOR_SUCCESS)
+
+    def _run_rl_tuning(self, K, T, tau):
+        """强化学习整定: Q-Learning 自动探索最优 PID 参数"""
+        self.btn_tune.config(state='disabled', text='训练中...')
+        self.lbl_recommend.config(text='Q-Learning 正在探索参数空间...', fg=COLOR_WARNING)
+        self.root.update_idletasks()
+
+        episodes = 200
+
+        def progress_cb(ep, total, eps, best_r, best_params):
+            """每 episode 更新 GUI 进度"""
+            if ep % 10 == 0 or ep == total:
+                pct = ep * 100 // total
+                self.lbl_recommend.config(
+                    text=f'训练中 [{pct}%] ep={ep}/{total} ε={eps:.2f} '
+                         f'best Kp={best_params[0]:.2f} Ki={best_params[1]:.2f} '
+                         f'Kd={best_params[2]:.2f}',
+                    fg=COLOR_WARNING)
+                self.root.update_idletasks()
+
+        try:
+            result = rl_tune(K, T, tau,
+                             setpoint=self.setpoint.get(),
+                             sim_time=self.sim_time.get(),
+                             episodes=episodes,
+                             progress_callback=progress_cb)
+
+            if result is None:
+                self.lbl_recommend.config(text='训练失败 — 请重试', fg=COLOR_DANGER)
+                self.btn_tune.config(state='normal', text='开始训练')
+                return
+
+            self.recommended_params = result
+            self.btn_apply.config(state='normal')
+
+            m = result.get('metrics', {})
+            dr = m.get('decay_rate')
+            dr_str = f'{dr*100:.0f}%' if dr is not None else 'N/A'
+            self.lbl_recommend.config(
+                text=f'RL→Kp={result["Kp"]:.2f} Ki={result["Ki"]:.2f} Kd={result["Kd"]:.2f} '
+                     f'| σ={m.get("overshoot",0):.1f}% φ={dr_str} IAE={m.get("iae",0):.3f}',
+                fg=COLOR_SUCCESS)
+
+        except Exception as e:
+            self.lbl_recommend.config(text=f'RL训练出错: {e}', fg=COLOR_DANGER)
+        finally:
+            self.btn_tune.config(state='normal', text='开始训练')
 
     def apply_recommended(self):
         if self.recommended_params is None:
