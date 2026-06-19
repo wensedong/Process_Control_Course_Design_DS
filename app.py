@@ -40,6 +40,7 @@ from tuning_methods import (
 from data_export import save_figure, save_csv, _get_default_dir, _timestamp
 from fuzzy_pid import FuzzyPIDController
 from rl_tuner import rl_tune
+# dqn_tune 延迟导入 — PyTorch 非必需依赖
 
 
 # ============================================================
@@ -207,7 +208,7 @@ class PidTunerApp:
             row=0, column=0, sticky='e', padx=(0, 4))
         method_cb = ttk.Combobox(tunef, textvariable=self.tuning_method, width=16,
                                  values=['手动经验法', '临界比例带法', '衰减曲线法', '响应曲线法',
-                                         '模糊PID控制', '强化学习整定'],
+                                         '模糊PID控制', '强化学习整定', 'DQN强化学习整定'],
                                  state='readonly')
         method_cb.grid(row=0, column=1, columnspan=2, pady=2)
         method_cb.bind('<<ComboboxSelected>>', lambda e: self.on_method_change())
@@ -435,7 +436,12 @@ class PidTunerApp:
         elif method == '强化学习整定':
             self.btn_tune.config(text='开始训练')
             self.lbl_recommend.config(
-                text='Q-Learning自动探索最优PID参数 (500轮, 每轮最多8步)',
+                text='Q-Learning表格法 (500轮, 每轮8步, 离散状态)',
+                fg=COLOR_MUTED)
+        elif method == 'DQN强化学习整定':
+            self.btn_tune.config(text='开始训练')
+            self.lbl_recommend.config(
+                text='DQN神经网络 (500轮, 每轮8步, 连续状态, GPU加速)',
                 fg=COLOR_MUTED)
 
     def set_preset(self, preset_type):
@@ -482,6 +488,8 @@ class PidTunerApp:
             self.update_plot()
         elif method == '强化学习整定':
             self._run_rl_tuning(K, T, tau)
+        elif method == 'DQN强化学习整定':
+            self._run_dqn_tuning(K, T, tau)
 
     def _run_critical_manual(self, K, T, tau, law):
         from tuning_methods import manual_critical_measure
@@ -633,6 +641,60 @@ class PidTunerApp:
 
         except Exception as e:
             self.lbl_recommend.config(text=f'RL训练出错: {e}', fg=COLOR_DANGER)
+        finally:
+            self.btn_tune.config(state='normal', text='开始训练')
+
+    def _run_dqn_tuning(self, K, T, tau):
+        """DQN强化学习整定: 深度Q网络自动探索最优 PID 参数"""
+        try:
+            from dqn_tuner import dqn_tune
+        except ImportError as e:
+            messagebox.showwarning('DQN不可用',
+                f'DQN 需要 PyTorch, 但导入失败:\n{e}\n\n请执行: pip install torch')
+            return
+
+        self.btn_tune.config(state='disabled', text='训练中...')
+        self.lbl_recommend.config(
+            text='DQN 正在训练神经网络 (GPU加速)...', fg=COLOR_WARNING)
+        self.root.update_idletasks()
+
+        episodes = 500
+
+        def progress_cb(ep, total, eps, best_r, best_params):
+            if ep % 20 == 0 or ep == total:
+                pct = ep * 100 // total
+                self.lbl_recommend.config(
+                    text=f'DQN训练 [{pct}%] ep={ep}/{total} ε={eps:.2f} '
+                         f'Kp={best_params[0]:.2f} Ki={best_params[1]:.2f} '
+                         f'Kd={best_params[2]:.2f}',
+                    fg=COLOR_WARNING)
+                self.root.update_idletasks()
+
+        try:
+            result = dqn_tune(K, T, tau,
+                              setpoint=self.setpoint.get(),
+                              sim_time=self.sim_time.get(),
+                              episodes=episodes,
+                              progress_callback=progress_cb)
+
+            if result is None:
+                self.lbl_recommend.config(text='DQN训练失败 - 请重试', fg=COLOR_DANGER)
+                self.btn_tune.config(state='normal', text='开始训练')
+                return
+
+            self.recommended_params = result
+            self.btn_apply.config(state='normal')
+
+            m = result.get('metrics', {})
+            dr = m.get('decay_rate')
+            dr_str = f'{dr*100:.0f}%' if dr is not None else 'N/A'
+            self.lbl_recommend.config(
+                text=f'DQN→Kp={result["Kp"]:.2f} Ki={result["Ki"]:.2f} Kd={result["Kd"]:.2f} '
+                     f'| σ={m.get("overshoot",0):.1f}% φ={dr_str} IAE={m.get("iae",0):.3f}',
+                fg=COLOR_SUCCESS)
+
+        except Exception as e:
+            self.lbl_recommend.config(text=f'DQN训练出错: {e}', fg=COLOR_DANGER)
         finally:
             self.btn_tune.config(state='normal', text='开始训练')
 
