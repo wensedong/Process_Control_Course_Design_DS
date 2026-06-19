@@ -634,9 +634,11 @@ class PidTunerApp:
             m = result.get('metrics', {})
             dr = m.get('decay_rate')
             dr_str = f'{dr*100:.0f}%' if dr is not None else 'N/A'
+            csv_path = result.get('training_csv', '')
             self.lbl_recommend.config(
                 text=f'RL→Kp={result["Kp"]:.2f} Ki={result["Ki"]:.2f} Kd={result["Kd"]:.2f} '
-                     f'| σ={m.get("overshoot",0):.1f}% φ={dr_str} IAE={m.get("iae",0):.3f}',
+                     f'| σ={m.get("overshoot",0):.1f}% φ={dr_str} IAE={m.get("iae",0):.3f} '
+                     f'| 日志: {os.path.basename(csv_path)}' if csv_path else '',
                 fg=COLOR_SUCCESS)
 
         except Exception as e:
@@ -688,9 +690,11 @@ class PidTunerApp:
             m = result.get('metrics', {})
             dr = m.get('decay_rate')
             dr_str = f'{dr*100:.0f}%' if dr is not None else 'N/A'
+            csv_path = result.get('training_csv', '')
             self.lbl_recommend.config(
                 text=f'DQN→Kp={result["Kp"]:.2f} Ki={result["Ki"]:.2f} Kd={result["Kd"]:.2f} '
-                     f'| σ={m.get("overshoot",0):.1f}% φ={dr_str} IAE={m.get("iae",0):.3f}',
+                     f'| σ={m.get("overshoot",0):.1f}% φ={dr_str} IAE={m.get("iae",0):.3f} '
+                     f'| 日志: {os.path.basename(csv_path)}' if csv_path else '',
                 fg=COLOR_SUCCESS)
 
         except Exception as e:

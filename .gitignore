@@ -1,7 +1,8 @@
 # 导出文件 (图片 + 数据)
 *.png
 *.svg
-*.csv
+# 仅忽略 saved_results 根目录下的导出 CSV, 训练日志子目录(rl_training/dqn_training)保留
+saved_results/*.csv
 
 # Python
 __pycache__/

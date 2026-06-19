@@ -15,7 +15,10 @@
   # result = {'Kp': ..., 'Ki': ..., 'Kd': ..., 'method_name': ..., ...}
 """
 
+import csv
+import os
 import numpy as np
+from datetime import datetime
 from simulation import simulate, PlantConfig, PIDConfig, SimulationConfig
 from metrics import compute_metrics
 
@@ -279,7 +282,8 @@ class QLearningTuner:
         self.best_params = None
         self.best_reward = -float('inf')
         self.best_metrics = None
-        self.history = []       # 每 episode 的最佳奖励
+        self.history = []       # 每 episode 的最佳奖励 (向后兼容)
+        self.episode_log = []   # 每 episode 的详细记录 (供 CSV 导出)
 
     def _random_params(self):
         """
@@ -359,6 +363,9 @@ class QLearningTuner:
 
             episode_best_reward = -float('inf')
             episode_best_params = None
+            episode_terminal = False
+            episode_steps = 0
+            episode_stable = stable  # 初始仿真是否收敛
 
             for step in range(steps_per_episode):
                 # 选择动作
@@ -397,9 +404,25 @@ class QLearningTuner:
 
                 # 终止检查
                 if is_terminal_state(new_metrics, new_stable):
+                    episode_terminal = True
                     break
 
+            episode_steps = step + 1  # step 从 0 开始, +1 为实际步数
             self.history.append(episode_best_reward)
+
+            # 记录每轮详细日志 (供 CSV 导出)
+            bp = episode_best_params or (Kp, Ki, Kd)
+            self.episode_log.append({
+                'episode':      ep + 1,
+                'epsilon':      round(eps, 4),
+                'Kp':           bp[0],
+                'Ki':           bp[1],
+                'Kd':           bp[2],
+                'reward':       round(episode_best_reward, 4),
+                'steps':        episode_steps,
+                'is_terminal':  episode_terminal,
+                'stable':       episode_stable,
+            })
 
             # 衰减探索率
             eps = max(self.eps_end, eps * self.eps_decay)
@@ -464,6 +487,41 @@ class QLearningTuner:
             })
         return insights
 
+    def export_training_csv(self, path):
+        """
+        导出训练日志 CSV。
+
+        列: episode, epsilon, Kp, Ki, Kd, reward, steps, is_terminal, stable
+        """
+        if not self.episode_log:
+            return False
+
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+            w = csv.writer(f)
+            # 元数据头
+            w.writerow(['# Q-Learning PID 整定 — 训练日志'])
+            w.writerow(['# 时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+            w.writerow(['# 对象', f'K={self.K}, T={self.T}, tau={self.tau}'])
+            w.writerow(['# 设定值', str(self.setpoint)])
+            w.writerow(['# 最佳参数',
+                        f'Kp={self.best_params[0]:.4f} Ki={self.best_params[1]:.4f} Kd={self.best_params[2]:.4f}'
+                        if self.best_params else 'N/A'])
+            w.writerow(['# 最佳奖励', str(round(self.best_reward, 4))])
+            w.writerow(['#'])
+            # 数据头
+            w.writerow(['episode', 'epsilon', 'Kp', 'Ki', 'Kd', 'reward',
+                        'steps', 'is_terminal', 'stable'])
+            # 数据行
+            for row in self.episode_log:
+                w.writerow([
+                    row['episode'], row['epsilon'],
+                    f'{row["Kp"]:.4f}', f'{row["Ki"]:.4f}', f'{row["Kd"]:.4f}',
+                    f'{row["reward"]:.4f}', row['steps'],
+                    int(row['is_terminal']), int(row['stable']),
+                ])
+        return True
+
 
 # ============================================================
 # 便利函数 (供 GUI 调用)
@@ -495,6 +553,19 @@ def rl_tune(K, T, tau, setpoint=1.0, sim_time=25.0,
         steps_per_episode=steps_per_episode,
         progress_callback=progress_callback,
     )
+
+    # 自动保存训练日志 CSV
+    if result is not None:
+        save_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'saved_results', 'rl_training')
+        os.makedirs(save_dir, exist_ok=True)
+        csv_path = os.path.join(
+            save_dir,
+            f'rl_train_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
+        tuner.export_training_csv(csv_path)
+        result['training_csv'] = csv_path
+
     return result
 
 

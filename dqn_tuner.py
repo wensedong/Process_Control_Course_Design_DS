@@ -15,9 +15,12 @@ DQN (Deep Q-Network) PID 参数整定模块
   result = dqn_tune(K=1.0, T=2.0, tau=0.5, setpoint=1.0, episodes=500)
 """
 
+import csv
+import os
 import numpy as np
 import random
 from collections import deque
+from datetime import datetime
 
 from simulation import simulate, PlantConfig, PIDConfig, SimulationConfig
 from metrics import compute_metrics
@@ -262,7 +265,9 @@ class DQNTuner:
         self.best_params = None
         self.best_reward = -float('inf')
         self.best_metrics = None
-        self.history = []
+        self.history = []        # 每 episode 的最佳奖励 (向后兼容)
+        self.episode_log = []    # 每 episode 的详细记录 (供 CSV 导出)
+        self._ep_losses = []     # 当前 episode 的 loss 列表
 
         # 步数计数器 (用于打印训练统计)
         self._train_steps = 0
@@ -390,6 +395,9 @@ class DQNTuner:
                               self.setpoint, self.sim_time)
 
             episode_rewards = []
+            episode_stable = stable   # 初始仿真是否收敛
+            episode_terminal = False
+            self._ep_losses = []
 
             # ── Episode 内步循环 ──
             for step in range(steps_per_episode):
@@ -417,6 +425,8 @@ class DQNTuner:
 
                 # ⑤ 网络更新
                 loss = self.update_policy()
+                if loss is not None:
+                    self._ep_losses.append(loss)
 
                 # ⑥ 跟踪最佳参数 (全局)
                 if reward > self.best_reward:
@@ -431,10 +441,30 @@ class DQNTuner:
                 Kp, Ki, Kd = new_Kp, new_Ki, new_Kd
 
                 if done:
+                    episode_terminal = True
                     break
 
             # ── Episode 收尾 ──
-            self.history.append(max(episode_rewards) if episode_rewards else -float('inf'))
+            episode_steps = step + 1  # step 从 0 开始
+            best_ep_r = max(episode_rewards) if episode_rewards else -float('inf')
+            avg_loss = (sum(self._ep_losses) / len(self._ep_losses)
+                        if self._ep_losses else 0.0)
+            self.history.append(best_ep_r)
+
+            # 记录每轮详细日志 (供 CSV 导出)
+            bp = self.best_params or (Kp, Ki, Kd)
+            self.episode_log.append({
+                'episode':      ep + 1,
+                'epsilon':      round(eps, 4),
+                'Kp':           bp[0],
+                'Ki':           bp[1],
+                'Kd':           bp[2],
+                'reward':       round(best_ep_r, 4),
+                'avg_loss':     round(avg_loss, 6),
+                'steps':        episode_steps,
+                'is_terminal':  episode_terminal,
+                'stable':       episode_stable,
+            })
 
             # ε 指数衰减
             eps = max(self.eps_end, eps * self.eps_decay)
@@ -480,6 +510,39 @@ class DQNTuner:
             'optimizer': self.optimizer.state_dict(),
         }
 
+    def export_training_csv(self, path):
+        """
+        导出训练日志 CSV。
+
+        列: episode, epsilon, Kp, Ki, Kd, reward, avg_loss, steps, is_terminal, stable
+        """
+        if not self.episode_log:
+            return False
+
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+            w = csv.writer(f)
+            w.writerow(['# DQN PID 整定 — 训练日志'])
+            w.writerow(['# 时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+            w.writerow(['# 对象', f'K={self.K}, T={self.T}, tau={self.tau}'])
+            w.writerow(['# 设定值', str(self.setpoint)])
+            w.writerow(['# 最佳参数',
+                        f'Kp={self.best_params[0]:.4f} Ki={self.best_params[1]:.4f} Kd={self.best_params[2]:.4f}'
+                        if self.best_params else 'N/A'])
+            w.writerow(['# 最佳奖励', str(round(self.best_reward, 4))])
+            w.writerow(['# 设备', str(self.device)])
+            w.writerow(['#'])
+            w.writerow(['episode', 'epsilon', 'Kp', 'Ki', 'Kd', 'reward',
+                        'avg_loss', 'steps', 'is_terminal', 'stable'])
+            for row in self.episode_log:
+                w.writerow([
+                    row['episode'], row['epsilon'],
+                    f'{row["Kp"]:.4f}', f'{row["Ki"]:.4f}', f'{row["Kd"]:.4f}',
+                    f'{row["reward"]:.4f}', f'{row["avg_loss"]:.6f}',
+                    row['steps'], int(row['is_terminal']), int(row['stable']),
+                ])
+        return True
+
 
 # ============================================================
 # 便利函数 (供 GUI 调用)
@@ -497,11 +560,25 @@ def dqn_tune(K, T, tau, setpoint=1.0, sim_time=25.0,
         K=K, T=T, tau=tau,
         setpoint=setpoint, sim_time=sim_time,
     )
-    return tuner.train(
+    result = tuner.train(
         episodes=episodes,
         steps_per_episode=steps_per_episode,
         progress_callback=progress_callback,
     )
+
+    # 自动保存训练日志 CSV
+    if result is not None:
+        save_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'saved_results', 'dqn_training')
+        os.makedirs(save_dir, exist_ok=True)
+        csv_path = os.path.join(
+            save_dir,
+            f'dqn_train_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
+        tuner.export_training_csv(csv_path)
+        result['training_csv'] = csv_path
+
+    return result
 
 
 # ============================================================
