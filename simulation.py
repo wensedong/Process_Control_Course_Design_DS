@@ -162,22 +162,37 @@ class PIDController:
 # 闭环仿真
 # ============================================================
 
-def simulate(plant, pid, sim):
+def simulate(plant, pid, sim, controller=None):
     """
-    闭环PID仿真 (使用 dataclass 配置对象)。
+    闭环PID仿真 (支持固定PID或可插拔控制器)。
 
     参数:
         plant: PlantConfig — 对象参数 (K, T, tau)
-        pid:   PIDConfig   — 控制器参数 (Kp, Ki, Kd, output_min, output_max)
+        pid:   PIDConfig | controller对象
+               - 若为 PIDConfig: 创建固定参数 PIDController
+               - 若为有 compute(sp,pv) 方法的对象: 直接用作控制器
         sim:   SimulationConfig — 仿真设置 (setpoint, sim_time, dt, max_steps)
+        controller: 可选, 显式传入控制器对象 (优先级高于 pid)
 
     返回:
-        dict: {'t', 'sp', 'pv', 'co', 'error', 'stable'}
-              stable = True/False 表示仿真是否正常收敛
+        dict: {'t', 'sp', 'pv', 'co', 'error', 'stable',
+               'kp_hist', 'ki_hist', 'kd_hist'}
+              稳定时 kp_hist/ki_hist/kd_hist 仅含一个元素;
+              自适应控制器时记录每步参数变化历史。
     """
     plant_obj = Plant(K=plant.K, T=plant.T, tau=plant.tau, dt=sim.dt)
-    pid_obj = PIDController(Kp=pid.Kp, Ki=pid.Ki, Kd=pid.Kd, dt=sim.dt,
-                            output_min=pid.output_min, output_max=pid.output_max)
+
+    # 决定使用哪个控制器
+    if controller is not None:
+        ctrl_obj = controller
+    elif hasattr(pid, 'compute'):
+        # pid 本身就是一个控制器对象 (鸭子类型)
+        ctrl_obj = pid
+    else:
+        # pid 是 PIDConfig → 创建标准 PIDController
+        ctrl_obj = PIDController(Kp=pid.Kp, Ki=pid.Ki, Kd=pid.Kd, dt=sim.dt,
+                                 output_min=pid.output_min,
+                                 output_max=pid.output_max)
 
     n_steps = min(int(sim.sim_time / sim.dt), sim.max_steps)
     t = np.linspace(0, sim.sim_time, n_steps)
@@ -185,28 +200,37 @@ def simulate(plant, pid, sim):
     pv = np.zeros(n_steps)
     co = np.zeros(n_steps)
     error = np.zeros(n_steps)
+    kp_hist = np.zeros(n_steps)
+    ki_hist = np.zeros(n_steps)
+    kd_hist = np.zeros(n_steps)
 
     pv[0] = 0.0
     error[0] = sim.setpoint
     stable = True
 
+    # 记录初始参数
+    if hasattr(ctrl_obj, 'Kp'):
+        kp_hist[0] = ctrl_obj.Kp; ki_hist[0] = ctrl_obj.Ki; kd_hist[0] = ctrl_obj.Kd
+
     for i in range(1, n_steps):
-        co[i] = pid_obj.compute(sp[i], pv[i - 1])
+        co[i] = ctrl_obj.compute(sp[i], pv[i - 1])
         pv[i] = plant_obj.step(co[i])
         error[i] = sp[i] - pv[i]
 
+        # 记录控制器参数 (自适应控制器会在 compute 内部更新)
+        if hasattr(ctrl_obj, 'Kp'):
+            kp_hist[i] = ctrl_obj.Kp; ki_hist[i] = ctrl_obj.Ki; kd_hist[i] = ctrl_obj.Kd
+
         # 发散检测
         if not np.isfinite(pv[i]) or abs(pv[i]) > 1_000_000:
-            # 截断到发散点
-            t = t[:i + 1]
-            sp = sp[:i + 1]
-            pv = pv[:i + 1]
-            co = co[:i + 1]
-            error = error[:i + 1]
+            t = t[:i + 1]; sp = sp[:i + 1]; pv = pv[:i + 1]
+            co = co[:i + 1]; error = error[:i + 1]
+            kp_hist = kp_hist[:i + 1]; ki_hist = ki_hist[:i + 1]; kd_hist = kd_hist[:i + 1]
             stable = False
             break
 
-    return {'t': t, 'sp': sp, 'pv': pv, 'co': co, 'error': error, 'stable': stable}
+    return {'t': t, 'sp': sp, 'pv': pv, 'co': co, 'error': error,
+            'stable': stable, 'kp_hist': kp_hist, 'ki_hist': ki_hist, 'kd_hist': kd_hist}
 
 
 # ============================================================

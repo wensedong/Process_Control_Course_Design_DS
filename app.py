@@ -38,6 +38,7 @@ from tuning_methods import (
     DECAY_TABLE, CRITICAL_TABLE,
 )
 from data_export import save_figure, save_csv, _get_default_dir, _timestamp
+from fuzzy_pid import FuzzyPIDController
 
 
 # ============================================================
@@ -204,7 +205,8 @@ class PidTunerApp:
         tk.Label(tunef, text="方法:", bg='#ffffff', font=('Microsoft YaHei UI', 9)).grid(
             row=0, column=0, sticky='e', padx=(0, 4))
         method_cb = ttk.Combobox(tunef, textvariable=self.tuning_method, width=16,
-                                 values=['手动经验法', '临界比例带法', '衰减曲线法', '响应曲线法'],
+                                 values=['手动经验法', '临界比例带法', '衰减曲线法', '响应曲线法',
+                                         '模糊PID控制'],
                                  state='readonly')
         method_cb.grid(row=0, column=1, columnspan=2, pady=2)
         method_cb.bind('<<ComboboxSelected>>', lambda e: self.on_method_change())
@@ -424,18 +426,25 @@ class PidTunerApp:
             self.btn_tune.config(text='执行整定')
             self.lbl_recommend.config(text='点击"执行整定"计算',
                                        fg=COLOR_MUTED)
+        elif method == '模糊PID控制':
+            self.btn_tune.config(text='模糊PID已激活')
+            self.lbl_recommend.config(
+                text='拖动PID滑块设置基础参数, 模糊控制器会自动在线调整',
+                fg=COLOR_PRIMARY)
 
     def set_preset(self, preset_type):
         presets = {
-            'P':     {'Kp': 2.00, 'Ki': 0.00, 'Kd': 0.00},
-            'PI':    {'Kp': 1.50, 'Ki': 0.50, 'Kd': 0.00},
-            'PD':    {'Kp': 2.00, 'Ki': 0.00, 'Kd': 0.50},
-            'PID':   {'Kp': 2.00, 'Ki': 1.00, 'Kd': 0.50},
-            'reset': {'Kp': 1.00, 'Ki': 0.00, 'Kd': 0.00},
+            'P':     {'Kp': 2.00, 'Ki': 0.00, 'Kd': 0.00, 'law': 'P'},
+            'PI':    {'Kp': 1.50, 'Ki': 0.50, 'Kd': 0.00, 'law': 'PI'},
+            'PD':    {'Kp': 2.00, 'Ki': 0.00, 'Kd': 0.50, 'law': 'PID'},
+            'PID':   {'Kp': 2.00, 'Ki': 1.00, 'Kd': 0.50, 'law': 'PID'},
+            'reset': {'Kp': 1.00, 'Ki': 0.00, 'Kd': 0.00, 'law': None},
         }
         if preset_type in presets:
             p = presets[preset_type]
             self.Kp.set(p['Kp']); self.Ki.set(p['Ki']); self.Kd.set(p['Kd'])
+            if p['law'] is not None:
+                self.control_law.set(p['law'])
             self.stop_animation()
             self.update_plot()
 
@@ -462,6 +471,9 @@ class PidTunerApp:
             self._run_decay_curve(K, T, tau, law)
         elif method == '响应曲线法':
             self._run_response_curve(K, T, tau, law)
+        elif method == '模糊PID控制':
+            # 模糊PID不需要"执行整定" — 已经在 update_plot 中自动激活
+            self.update_plot()
 
     def _run_critical_manual(self, K, T, tau, law):
         from tuning_methods import manual_critical_measure
@@ -588,12 +600,25 @@ class PidTunerApp:
             sim_t = self.sim_time.get()
 
             plant_cfg = PlantConfig(K=K, T=T, tau=tau)
-            pid_cfg = PIDConfig(Kp=Kp, Ki=Ki, Kd=Kd,
-                                output_min=self.output_min.get(),
-                                output_max=self.output_max.get())
             sim_cfg = SimulationConfig(setpoint=sp_val, sim_time=sim_t)
 
-            result = simulate(plant_cfg, pid_cfg, sim_cfg)
+            # 模糊 PID 模式: 使用自适应控制器
+            if self.tuning_method.get() == '模糊PID控制':
+                ctrl = FuzzyPIDController(
+                    Kp_base=Kp, Ki_base=Ki, Kd_base=Kd,
+                    scale_Kp=0.3, scale_Ki=0.08, scale_Kd=0.04,
+                    e_max=1.0, ec_max=0.3, dt=0.01,
+                    output_min=self.output_min.get(),
+                    output_max=self.output_max.get())
+                pid_cfg = PIDConfig(Kp=Kp, Ki=Ki, Kd=Kd)  # 仅用于兼容
+                result = simulate(plant_cfg, pid_cfg, sim_cfg, controller=ctrl)
+                self._fuzzy_active = True
+            else:
+                pid_cfg = PIDConfig(Kp=Kp, Ki=Ki, Kd=Kd,
+                                    output_min=self.output_min.get(),
+                                    output_max=self.output_max.get())
+                result = simulate(plant_cfg, pid_cfg, sim_cfg)
+                self._fuzzy_active = False
 
             self._t     = result['t']
             self._sp    = result['sp']
@@ -601,6 +626,11 @@ class PidTunerApp:
             self._co    = result['co']
             self._error = result['error']
             self._stable = result['stable']
+
+            # 保存参数历史 (模糊PID模式用于绘图)
+            self._kp_hist = result['kp_hist']
+            self._ki_hist = result['ki_hist']
+            self._kd_hist = result['kd_hist']
 
             self._metrics = compute_metrics(self._t, self._sp, self._pv, self._error)
 
@@ -617,17 +647,22 @@ class PidTunerApp:
         t, sp, pv, co = self._t, self._sp, self._pv, self._co
         sim_t = self.sim_time.get()
         Kp, Ki, Kd = self.Kp.get(), self.Ki.get(), self.Kd.get()
+        fuzzy = getattr(self, '_fuzzy_active', False)
 
         self.fig.set_facecolor(COLOR_PLOT_BG)
 
-        ax1 = self.fig.add_subplot(211)
+        if fuzzy:
+            # 模糊PID: 三子图 (PV, CO, Kp/Ki/Kd变化)
+            ax1 = self.fig.add_subplot(311)
+        else:
+            ax1 = self.fig.add_subplot(211)
         ax1.set_facecolor('white')
         ax1.plot(t, sp, 'k--', lw=1.5, alpha=0.7, label=f'SP={self.setpoint.get()}')
         ax1.plot(t, pv, COLOR_PRIMARY, lw=2.0,
                  label=f'PV (Kp={Kp:.2f} Ki={Ki:.2f} Kd={Kd:.2f})')
         ax1.set_ylabel('输出 y(t)', fontsize=9)
-        ax1.set_title('PID控制阶跃响应曲线', fontsize=12, fontweight='bold',
-                      color='#1e293b')
+        title = '模糊PID控制阶跃响应曲线' if fuzzy else 'PID控制阶跃响应曲线'
+        ax1.set_title(title, fontsize=12, fontweight='bold', color='#1e293b')
         ax1.legend(loc='lower right', fontsize=8, framealpha=0.9)
         ax1.grid(True, alpha=0.3, color='#cbd5e1')
         ax1.set_xlim(0, sim_t)
@@ -636,7 +671,7 @@ class PidTunerApp:
                         lw=0.6, ls=':', alpha=0.5)
         ax1.axhline(sp[0], color=COLOR_SUCCESS, lw=0.6, ls=':', alpha=0.3)
 
-        # 传递函数分式标注 (左上角)
+        # 传递函数分式标注
         pk, pT, ptau = self.plant_K.get(), self.plant_T.get(), self.plant_tau.get()
         if ptau > 0:
             tf_str = r'$G(s)=\frac{%.2f\ e^{-%.2fs}}{%.2fs+1}$' % (pk, ptau, pT)
@@ -647,18 +682,40 @@ class PidTunerApp:
                  bbox=dict(boxstyle='round,pad=0.3', facecolor='#fffbeb',
                            edgecolor='#d97706', alpha=0.9))
 
-        ax2 = self.fig.add_subplot(212, sharex=ax1)
+        if fuzzy:
+            # 控制量子图
+            ax2 = self.fig.add_subplot(312, sharex=ax1)
+        else:
+            ax2 = self.fig.add_subplot(212, sharex=ax1)
         ax2.set_facecolor('white')
         ax2.plot(t, co, COLOR_DANGER, lw=1.5, alpha=0.85, label='控制量 CO(t)')
-        # 输出限幅参考线
         umin, umax = self.output_min.get(), self.output_max.get()
         ax2.axhline(umin, color='gray', lw=0.5, ls=':', alpha=0.4)
         ax2.axhline(umax, color='gray', lw=0.5, ls=':', alpha=0.4)
-        ax2.set_xlabel('时间 t (s)', fontsize=9)
         ax2.set_ylabel('控制量 u(t)', fontsize=9)
         ax2.legend(loc='upper right', fontsize=8, framealpha=0.9)
         ax2.grid(True, alpha=0.3, color='#cbd5e1')
         ax2.set_xlim(0, sim_t)
+
+        if fuzzy:
+            # 参数变化子图 (模糊PID专用)
+            ax3 = self.fig.add_subplot(313, sharex=ax1)
+            ax3.set_facecolor('white')
+            kp_h = getattr(self, '_kp_hist', None)
+            ki_h = getattr(self, '_ki_hist', None)
+            kd_h = getattr(self, '_kd_hist', None)
+            if kp_h is not None and len(kp_h) == len(t):
+                ax3.plot(t, kp_h, COLOR_PRIMARY, lw=1.2, alpha=0.8, label='Kp(t)')
+                ax3.plot(t, ki_h, COLOR_SUCCESS, lw=1.2, alpha=0.8, label='Ki(t)')
+                ax3.plot(t, kd_h, COLOR_WARNING, lw=1.2, alpha=0.8, label='Kd(t)')
+            ax3.set_xlabel('时间 t (s)', fontsize=9)
+            ax3.set_ylabel('PID参数', fontsize=9)
+            ax3.set_title('模糊控制器在线参数调整', fontsize=9, color='#64748b')
+            ax3.legend(loc='upper right', fontsize=7, ncol=3, framealpha=0.9)
+            ax3.grid(True, alpha=0.3, color='#cbd5e1')
+            ax3.set_xlim(0, sim_t)
+        else:
+            ax2.set_xlabel('时间 t (s)', fontsize=9)
 
         self.fig.tight_layout()
         self.canvas.draw()
@@ -709,11 +766,15 @@ class PidTunerApp:
         end = min(self._anim_frame + speed * 10, n - 1)
         sim_t = self.sim_time.get()
         Kp, Ki, Kd = self.Kp.get(), self.Ki.get(), self.Kd.get()
+        fuzzy = getattr(self, '_fuzzy_active', False)
 
         self.fig.clear()
         self.fig.set_facecolor(COLOR_PLOT_BG)
 
-        ax1 = self.fig.add_subplot(211)
+        if fuzzy:
+            ax1 = self.fig.add_subplot(311)
+        else:
+            ax1 = self.fig.add_subplot(211)
         ax1.set_facecolor('white')
         ax1.plot(t[:end+1], sp[:end+1], 'k--', lw=1.5, alpha=0.7,
                  label=f'SP={self.setpoint.get()}')
@@ -725,20 +786,41 @@ class PidTunerApp:
         ax1.legend(loc='lower right', fontsize=8, framealpha=0.9)
         ax1.grid(True, alpha=0.3, color='#cbd5e1')
         ax1.set_xlim(0, sim_t)
-        y_min, y_max = min(np.min(pv[:end+1]), np.min(sp[:end+1])) - 0.05, \
-                       max(np.max(pv[:end+1]), np.max(sp[:end+1])) + 0.1
+        y_min = min(np.min(pv[:end+1]), np.min(sp[:end+1])) - 0.05
+        y_max = max(np.max(pv[:end+1]), np.max(sp[:end+1])) + 0.1
         ax1.set_ylim(y_min, y_max)
 
-        ax2 = self.fig.add_subplot(212, sharex=ax1)
+        if fuzzy:
+            ax2 = self.fig.add_subplot(312, sharex=ax1)
+        else:
+            ax2 = self.fig.add_subplot(212, sharex=ax1)
         ax2.set_facecolor('white')
         ax2.plot(t[:end+1], co[:end+1], COLOR_DANGER, lw=1.5, alpha=0.85)
         umin, umax = self.output_min.get(), self.output_max.get()
         ax2.axhline(umin, color='gray', lw=0.5, ls=':', alpha=0.4)
         ax2.axhline(umax, color='gray', lw=0.5, ls=':', alpha=0.4)
-        ax2.set_xlabel('时间 t (s)', fontsize=9)
         ax2.set_ylabel('控制量 u(t)', fontsize=9)
         ax2.grid(True, alpha=0.3, color='#cbd5e1')
         ax2.set_xlim(0, sim_t)
+
+        if fuzzy:
+            ax3 = self.fig.add_subplot(313, sharex=ax1)
+            ax3.set_facecolor('white')
+            kp_h = getattr(self, '_kp_hist', None)
+            ki_h = getattr(self, '_ki_hist', None)
+            kd_h = getattr(self, '_kd_hist', None)
+            if kp_h is not None and len(kp_h) >= end + 1:
+                ax3.plot(t[:end+1], kp_h[:end+1], COLOR_PRIMARY, lw=1.2, label='Kp(t)')
+                ax3.plot(t[:end+1], ki_h[:end+1], COLOR_SUCCESS, lw=1.2, label='Ki(t)')
+                ax3.plot(t[:end+1], kd_h[:end+1], COLOR_WARNING, lw=1.2, label='Kd(t)')
+            ax3.set_xlabel('时间 t (s)', fontsize=9)
+            ax3.set_ylabel('PID参数', fontsize=9)
+            ax3.set_title('模糊控制器在线参数调整', fontsize=9, color='#64748b')
+            ax3.legend(loc='upper right', fontsize=7, ncol=3, framealpha=0.9)
+            ax3.grid(True, alpha=0.3, color='#cbd5e1')
+            ax3.set_xlim(0, sim_t)
+        else:
+            ax2.set_xlabel('时间 t (s)', fontsize=9)
 
         self.fig.tight_layout()
         self.canvas.draw()

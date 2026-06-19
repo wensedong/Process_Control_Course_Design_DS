@@ -1,5 +1,7 @@
 @echo off
 chcp 65001 >nul
-cd /d "E:\学习资料\06大三下\过控\课设_ds\PID_deepseek"
+chcp 65001 >nul
+cd /d "%~dp0"
+echo 正在启动 PID 参数整定程序...
 python app.py
 pause
