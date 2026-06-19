@@ -1,0 +1,17 @@
+# 导出文件 (图片 + 数据)
+*.png
+*.svg
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# 系统
+Thumbs.db
+.DS_Store

@@ -435,7 +435,7 @@ class PidTunerApp:
         elif method == '强化学习整定':
             self.btn_tune.config(text='开始训练')
             self.lbl_recommend.config(
-                text='Q-Learning自动探索最优PID参数 (约200轮仿真)',
+                text='Q-Learning自动探索最优PID参数 (500轮, 每轮最多8步)',
                 fg=COLOR_MUTED)
 
     def set_preset(self, preset_type):
@@ -595,7 +595,7 @@ class PidTunerApp:
         self.lbl_recommend.config(text='Q-Learning 正在探索参数空间...', fg=COLOR_WARNING)
         self.root.update_idletasks()
 
-        episodes = 200
+        episodes = 500
 
         def progress_cb(ep, total, eps, best_r, best_params):
             """每 episode 更新 GUI 进度"""

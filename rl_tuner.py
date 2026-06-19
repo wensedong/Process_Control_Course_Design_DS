@@ -11,7 +11,7 @@
 
 用法:
   from rl_tuner import rl_tune
-  result = rl_tune(K=1.0, T=1.0, tau=0.5, setpoint=1.0, episodes=200)
+  result = rl_tune(K=1.0, T=1.0, tau=0.5, setpoint=1.0, episodes=500)
   # result = {'Kp': ..., 'Ki': ..., 'Kd': ..., 'method_name': ..., ...}
 """
 
@@ -42,9 +42,10 @@ KI_INIT  = 0.05      # Ki 从 0 启动时的初值
 KD_INIT  = 0.02      # Kd 从 0 启动时的初值
 
 # 参数范围
+# 注意: KI_MIN/KD_MIN 设为小正数而非 0 — 若为 0，参数被除到 0 后无法通过乘因子恢复
 KP_MIN, KP_MAX = 0.01, 20.0
-KI_MIN, KI_MAX = 0.0,  5.0
-KD_MIN, KD_MAX = 0.0,  5.0
+KI_MIN, KI_MAX = 0.001, 5.0
+KD_MIN, KD_MAX = 0.001, 5.0
 
 # Q-Learning 超参数
 ALPHA   = 0.1         # 学习率
@@ -281,10 +282,30 @@ class QLearningTuner:
         self.history = []       # 每 episode 的最佳奖励
 
     def _random_params(self):
-        """生成随机初始 PID 参数"""
-        Kp = 10 ** np.random.uniform(-0.3, 0.7)   # 0.5 ~ 5.0
-        Ki = np.random.uniform(0, 2.0)
-        Kd = np.random.uniform(0, 1.0)
+        """
+        生成随机初始 PID 参数 (稳定性感知)。
+
+        对于有迟延系统: 根据 FOPDT 近似稳定边界约束 Kp 上限。
+        Kp_crit ≈ T / (K · τ)，初始化在 ~60% 临界值以内，
+        避免 Agent 在必然发散的参数区域浪费探索步数。
+        """
+        if self.tau > 1e-6:
+            # 一阶+迟延: 粗略稳定边界估计
+            kp_crit_est = self.T / (self.K * self.tau * 1.2)
+            kp_max_init = min(5.0, kp_crit_est * 0.6)
+            kp_min_init = 0.1
+        else:
+            # 无迟延: 一阶惯性系统无条件稳定 (纯比例下)
+            kp_max_init = 8.0
+            kp_min_init = 0.3
+
+        # 对数均匀采样 Kp (PID 参数通常在对数尺度上更均匀)
+        Kp = 10 ** np.random.uniform(
+            np.log10(max(KP_MIN, kp_min_init)),
+            np.log10(max(kp_max_init, kp_min_init * 2)))
+        # Ki/Kd 上限与 Kp 联动, 避免积分/微分过强
+        Ki = np.random.uniform(KI_MIN, min(2.0, Kp * 0.6))
+        Kd = np.random.uniform(KD_MIN, min(1.0, Kp * 0.25))
         return round(Kp, 4), round(Ki, 4), round(Kd, 4)
 
     def _choose_action(self, s, eps):
@@ -299,14 +320,24 @@ class QLearningTuner:
             candidates = np.where(self.Q[s, :] == max_val)[0]
             return np.random.choice(candidates)
 
-    def train(self, episodes=200, steps_per_episode=15,
+    def train(self, episodes=500, steps_per_episode=8,
               progress_callback=None):
         """
         训练 Q-Learning 整定器。
 
+        注意 — 状态转移的特殊性:
+          本问题中, 每个 RL step 需要运行一次**完整仿真** (sim_time 秒)
+          才能获得新状态 s'。这不是标准的逐时间步 MDP, 而是:
+            "当前 PID 参数的性能" —动作→ "新 PID 参数的性能"
+          每一步都是独立的阶跃响应, 从 t=0 重新启动。
+          因此:
+            - steps_per_episode 不宜过大 (避免在同一条轨迹上绕圈)
+            - episodes 应足够大 (靠多轮重启充分探索参数空间)
+            - 本质更接近 episodic parameter optimization
+
         参数:
-            episodes:          训练轮数
-            steps_per_episode: 每轮最大调整步数
+            episodes:          训练轮数 (默认 500)
+            steps_per_episode: 每轮最大调整步数 (默认 8)
             progress_callback: 可选, 每 episode 调用 callback(ep, eps, best_r, best_params)
 
         返回:
@@ -315,7 +346,7 @@ class QLearningTuner:
         eps = self.eps_start
 
         for ep in range(episodes):
-            # 随机初始参数
+            # 随机初始参数 (稳定性感知)
             Kp, Ki, Kd = self._random_params()
 
             # 初始仿真 → 初始状态
@@ -439,7 +470,7 @@ class QLearningTuner:
 # ============================================================
 
 def rl_tune(K, T, tau, setpoint=1.0, sim_time=25.0,
-            episodes=200, steps_per_episode=15,
+            episodes=500, steps_per_episode=8,
             progress_callback=None):
     """
     强化学习 PID 整定的便捷入口。
@@ -494,7 +525,7 @@ if __name__ == '__main__':
 
     result = rl_tune(test_K, test_T, test_tau,
                      setpoint=1.0, sim_time=30.0,
-                     episodes=200, progress_callback=show_progress)
+                     episodes=500, progress_callback=show_progress)
 
     if result:
         m = result['metrics']
