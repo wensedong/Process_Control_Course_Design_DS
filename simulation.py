@@ -159,6 +159,76 @@ class PIDController:
 
 
 # ============================================================
+# 增量式 PID 控制器 (抗饱和, 无冲击切换)
+# ============================================================
+
+class IncrementalPIDController:
+    """增量式PID控制器 — 输出增量Δu, 天然抗积分饱和, 切换无冲击
+
+    增量公式:
+      Δu(k) = Kp·[e(k)-e(k-1)] + Ki·e(k)·dt + Kd·[e(k)-2e(k-1)+e(k-2)]/dt
+      u(k)  = u(k-1) + Δu(k)
+
+    与位置式的区别:
+      - 不对历史误差累加, 只关注最近3拍误差
+      - 输出 = 上一拍输出 + 增量, 天然无积分饱和
+      - 适合执行器有记忆的场景 (如步进电机、阀门定位器)
+    """
+
+    def __init__(self, Kp=1.0, Ki=0.0, Kd=0.0, dt=0.01,
+                 output_min=-1e6, output_max=1e6):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        self.dt = dt
+        self.output_min = output_min
+        self.output_max = output_max
+        self.reset()
+
+    def reset(self):
+        self.prev_error = 0.0       # e(k-1)
+        self.prev2_error = 0.0      # e(k-2)
+        self.prev_u = 0.0           # u(k-1)
+        self._ready = False         # 首次调用标记
+
+    def compute(self, setpoint, pv):
+        """每步计算控制增量并输出"""
+        error = setpoint - pv
+
+        if not self._ready:
+            # 首次调用: 用位置式思想给出合理的初始输出, 避免 Δu=0
+            self._ready = True
+            self.prev_error = error
+            self.prev2_error = error
+            u = self.Kp * error + self.Ki * error * self.dt
+            u = max(self.output_min, min(self.output_max, u))
+            self.prev_u = u
+            return u
+
+        # 增量计算: Δu = P_inc + I_inc + D_inc
+        dKp = self.Kp * (error - self.prev_error)
+        dKi = self.Ki * error * self.dt
+        dKd = self.Kd * (error - 2 * self.prev_error + self.prev2_error) / self.dt
+
+        delta_u = dKp + dKi + dKd
+        u = self.prev_u + delta_u
+        u = max(self.output_min, min(self.output_max, u))
+
+        # 抗饱和: 若输出被限幅, 反馈修正 prev_u 防止积分 windup
+        if u == self.output_max and delta_u > 0:
+            self.prev_u = u  # 限幅, 不再累加
+        elif u == self.output_min and delta_u < 0:
+            self.prev_u = u
+        else:
+            self.prev_u = u
+
+        self.prev2_error = self.prev_error
+        self.prev_error = error
+
+        return u
+
+
+# ============================================================
 # 闭环仿真
 # ============================================================
 

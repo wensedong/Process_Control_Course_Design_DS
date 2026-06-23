@@ -27,8 +27,9 @@ from matplotlib.figure import Figure
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import os
+import csv
 
-from simulation import Plant, simulate, PlantConfig, PIDConfig, SimulationConfig
+from simulation import Plant, simulate, PlantConfig, PIDConfig, SimulationConfig, IncrementalPIDController
 from metrics import compute_metrics
 from tuning_methods import (
     critical_ratio_calculate, auto_find_critical, manual_critical_measure,
@@ -64,7 +65,8 @@ class PidTunerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("PID参数整定 v3.1 — 单回路控制系统")
-        self.root.geometry("1200x920")
+        # self.root.geometry("1200x920")   # 旧: 宽屏
+        self.root.geometry("1050x980")     # 新: 近正方形
         self.root.configure(bg=COLOR_BG)
 
         # ---- 设置 ttk 主题 ----
@@ -215,8 +217,8 @@ class PidTunerApp:
 
         tk.Label(tunef, text="规律:", bg='#ffffff', font=('Microsoft YaHei UI', 9)).grid(
             row=1, column=0, sticky='e', padx=(0, 4))
-        law_cb = ttk.Combobox(tunef, textvariable=self.control_law, width=6,
-                              values=['P', 'PI', 'PID'], state='readonly')
+        law_cb = ttk.Combobox(tunef, textvariable=self.control_law, width=8,
+                              values=['P', 'PI', 'PID', '增量PI', '增量PID'], state='readonly')
         law_cb.grid(row=1, column=1, pady=2)
         law_cb.bind('<<ComboboxSelected>>', lambda e: self.on_method_change())
 
@@ -315,7 +317,9 @@ class PidTunerApp:
         self.status_label.pack(fill=tk.X, padx=12, pady=(2, 1))
 
         # ====== 图表 ======
-        self.fig = Figure(figsize=(9, 6.5), dpi=100,
+        # self.fig = Figure(figsize=(9, 6.5), dpi=100,   # 旧: 宽屏比例
+        #                   facecolor=COLOR_PLOT_BG)
+        self.fig = Figure(figsize=(7.5, 7.5), dpi=100,    # 新: 正方形
                           facecolor=COLOR_PLOT_BG)
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=2)
@@ -641,6 +645,11 @@ class PidTunerApp:
                      f'| 日志: {os.path.basename(csv_path)}' if csv_path else '',
                 fg=COLOR_SUCCESS)
 
+            # 训练完成 → 弹窗展示演化曲线
+            if csv_path:
+                self.root.after(300, lambda: self.show_evolution_curves(
+                    csv_path, 'Q-Learning'))
+
         except Exception as e:
             self.lbl_recommend.config(text=f'RL训练出错: {e}', fg=COLOR_DANGER)
         finally:
@@ -697,6 +706,11 @@ class PidTunerApp:
                      f'| 日志: {os.path.basename(csv_path)}' if csv_path else '',
                 fg=COLOR_SUCCESS)
 
+            # 训练完成 → 弹窗展示演化曲线
+            if csv_path:
+                self.root.after(300, lambda p=csv_path: self.show_evolution_curves(
+                    p, 'DQN'))
+
         except Exception as e:
             self.lbl_recommend.config(text=f'DQN训练出错: {e}', fg=COLOR_DANGER)
         finally:
@@ -734,6 +748,18 @@ class PidTunerApp:
                 pid_cfg = PIDConfig(Kp=Kp, Ki=Ki, Kd=Kd)  # 仅用于兼容
                 result = simulate(plant_cfg, pid_cfg, sim_cfg, controller=ctrl)
                 self._fuzzy_active = True
+            elif self.control_law.get() in ('增量PI', '增量PID'):
+                # 增量式 PID: 对 PV 微分, 步进增量输出
+                law = self.control_law.get()
+                inc_Kd = Kd if law == '增量PID' else 0.0
+                inc_Ki = Ki if law == '增量PI' or law == '增量PID' else 0.0
+                ctrl = IncrementalPIDController(
+                    Kp=Kp, Ki=inc_Ki, Kd=inc_Kd, dt=0.01,
+                    output_min=self.output_min.get(),
+                    output_max=self.output_max.get())
+                pid_cfg = PIDConfig(Kp=Kp, Ki=inc_Ki, Kd=inc_Kd)
+                result = simulate(plant_cfg, pid_cfg, sim_cfg, controller=ctrl)
+                self._fuzzy_active = False
             else:
                 pid_cfg = PIDConfig(Kp=Kp, Ki=Ki, Kd=Kd,
                                     output_min=self.output_min.get(),
@@ -1068,6 +1094,164 @@ class PidTunerApp:
                      self._t, self._sp, self._pv, self._co, self._error,
                      method_name, stable=self._stable)
             messagebox.showinfo("OK", f"已导出:\n{p}")
+
+    # ==================================================================
+    # 训练演化曲线弹窗 (每100轮画一条阶跃响应曲线)
+    # ==================================================================
+
+    def show_evolution_curves(self, csv_path, method_label):
+        """
+        从训练日志 CSV 中读取每 100 轮的 Kp/Ki/Kd,
+        重新仿真得到阶跃响应曲线, 叠加绘制以展示参数演化过程。
+
+        参数:
+            csv_path:      训练日志 CSV 路径
+            method_label:  'Q-Learning' 或 'DQN' (用于标题)
+        """
+        if not csv_path or not os.path.exists(csv_path):
+            messagebox.showwarning('提示', f'训练日志不存在:\n{csv_path}')
+            return
+
+        # ── ① 解析 CSV ──
+        rows = []
+        meta = {}  # K, T, tau, setpoint
+        try:
+            with open(csv_path, 'r', encoding='utf-8-sig') as f:
+                reader = csv.reader(f)
+                for line in reader:
+                    if not line:
+                        continue
+                    if line[0].startswith('#'):
+                        # 解析元数据
+                        if len(line) >= 2:
+                            key = line[0].lstrip('#').strip()
+                            val = line[1].strip()
+                            if '对象' in key:
+                                # 格式: "K=1.0, T=1.0, tau=0.89"
+                                for part in val.split(','):
+                                    part = part.strip()
+                                    if '=' in part:
+                                        kk, vv = part.split('=', 1)
+                                        meta[kk.strip()] = float(vv.strip())
+                            elif '设定值' in key:
+                                meta['setpoint'] = float(val)
+                        continue
+                    # 跳过表头
+                    if line[0] == 'episode':
+                        continue
+                    # 数据行: episode, epsilon, Kp, Ki, Kd, reward, ...
+                    try:
+                        rows.append({
+                            'episode': int(line[0]),
+                            'Kp': float(line[2]),
+                            'Ki': float(line[3]),
+                            'Kd': float(line[4]),
+                            'reward': float(line[5]),
+                        })
+                    except (ValueError, IndexError):
+                        continue
+        except Exception as e:
+            messagebox.showerror('解析失败', f'读取 CSV 出错:\n{e}')
+            return
+
+        if not rows:
+            messagebox.showwarning('提示', 'CSV 中无有效数据')
+            return
+
+        K = meta.get('K', self.plant_K.get())
+        T = meta.get('T', self.plant_T.get())
+        tau = meta.get('tau', self.plant_tau.get())
+        sp = meta.get('setpoint', self.setpoint.get())
+        sim_t = self.sim_time.get()
+
+        # ── ② 选取检查点: 每 100 轮, 取最近的行 ──
+        total_episodes = rows[-1]['episode']
+        targets = [100, 200, 300, 400, 500]
+        checkpoints = []
+        for target in targets:
+            if target > total_episodes:
+                break
+            # 找 episode 最接近 target 的行
+            best_row = min(rows, key=lambda r: abs(r['episode'] - target))
+            checkpoints.append({'label': f'ep={best_row["episode"]}',
+                                'Kp': best_row['Kp'], 'Ki': best_row['Ki'],
+                                'Kd': best_row['Kd'], 'reward': best_row['reward']})
+
+        if len(checkpoints) < 2:
+            messagebox.showwarning('提示', f'训练轮数过少 ({total_episodes}), '
+                                         f'不足以画演化曲线 (至少需要2个检查点)')
+            return
+
+        # ── ③ 对各检查点参数运行仿真 ──
+        curves = []
+        for cp in checkpoints:
+            r = simulate(
+                PlantConfig(K=K, T=T, tau=tau),
+                PIDConfig(Kp=cp['Kp'], Ki=cp['Ki'], Kd=cp['Kd'],
+                          output_min=self.output_min.get(),
+                          output_max=self.output_max.get()),
+                SimulationConfig(setpoint=sp, sim_time=sim_t))
+            curves.append({'label': cp['label'],
+                           'Kp': cp['Kp'], 'Ki': cp['Ki'], 'Kd': cp['Kd'],
+                           'reward': cp['reward'],
+                           't': r['t'], 'pv': r['pv']})
+
+        # ── ④ 弹窗绘图 ──
+        popup = tk.Toplevel(self.root)
+        popup.title(f'{method_label} — 训练演化曲线 (每100轮)')
+        popup.geometry('900x700')
+        popup.configure(bg='#ffffff')
+
+        fig = Figure(figsize=(8, 6), dpi=100, facecolor='white')
+        ax = fig.add_subplot(111)
+        ax.set_facecolor('white')
+
+        # 颜色从浅到深
+        n = len(curves)
+        cmap = plt.cm.Blues
+        colors = [cmap(0.3 + 0.7 * i / n) for i in range(n)]
+
+        for i, cv in enumerate(curves):
+            alpha_val = 0.5 + 0.5 * i / n
+            lw = 1.0 + 1.5 * i / n
+            ls = '-' if i == n - 1 else '--'
+            ax.plot(cv['t'], cv['pv'], color=colors[i], lw=lw, ls=ls,
+                    alpha=alpha_val,
+                    label=f"{cv['label']}  "
+                          f"Kp={cv['Kp']:.3f} Ki={cv['Ki']:.3f} Kd={cv['Kd']:.3f}")
+
+        # 设定值线
+        ax.axhline(sp, color='green', lw=1.5, ls=':', alpha=0.6, label=f'SP={sp}')
+        ax.set_xlabel('时间 t (s)', fontsize=10)
+        ax.set_ylabel('过程变量 PV', fontsize=10)
+        ax.set_title(f'{method_label} 训练演化 — 阶跃响应曲线 (浅→深: 轮数递增)',
+                     fontsize=13, fontweight='bold')
+        ax.legend(loc='lower right', fontsize=7.5, framealpha=0.9, ncol=1)
+        ax.grid(True, alpha=0.25, color='#cbd5e1')
+        ax.set_xlim(0, sim_t)
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=popup)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        # 底部信息栏
+        info = tk.Label(popup,
+                        text=f'共 {total_episodes} 轮 | '
+                             f'对象: K={K}, T={T}, τ={tau} | '
+                             f'设定值: {sp} | '
+                             f'最终参数: Kp={curves[-1]["Kp"]:.4f} '
+                             f'Ki={curves[-1]["Ki"]:.4f} '
+                             f'Kd={curves[-1]["Kd"]:.4f} '
+                             f'奖励={curves[-1]["reward"]:.2f}',
+                        font=('Microsoft YaHei UI', 9),
+                        fg='#475569', bg='#f8fafc')
+        info.pack(fill=tk.X, padx=8, pady=(0, 6))
+
+        # 工具栏
+        from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+        bar = ttk.Frame(popup)
+        bar.pack(fill=tk.X, padx=6, pady=(0, 4))
+        NavigationToolbar2Tk(canvas, bar).update()
 
     # ==================================================================
     # 关闭
