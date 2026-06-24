@@ -29,7 +29,7 @@ from tkinter import ttk, filedialog, messagebox
 import os
 import csv
 
-from simulation import Plant, simulate, PlantConfig, PIDConfig, SimulationConfig
+from simulation import Plant, simulate, PlantConfig, PIDConfig, SimulationConfig, RealPIDController
 from metrics import compute_metrics
 from tuning_methods import (
     critical_ratio_calculate, auto_find_critical, manual_critical_measure,
@@ -109,6 +109,7 @@ class PidTunerApp:
         self.sim_time   = tk.DoubleVar(value=25.0)
         self.output_min = tk.DoubleVar(value=-10.0)
         self.output_max = tk.DoubleVar(value=10.0)
+        self.Tf         = tk.DoubleVar(value=0.1)     # 实际PID微分滤波时间常数
 
         # 整定方法相关
         self.control_law   = tk.StringVar(value='PID')
@@ -194,7 +195,8 @@ class PidTunerApp:
         presetf = tk.LabelFrame(ctrl, text=" 预设 ", font=('Microsoft YaHei UI', 9),
                                 fg='#334155', bg='#ffffff', padx=6, pady=4)
         presetf.grid(row=0, column=3, padx=5, pady=2, sticky='n')
-        for t, v in [("P", 'P'), ("PI", 'PI'), ("PD", 'PD'), ("PID", 'PID'), ("重置", 'reset')]:
+        for t, v in [("P", 'P'), ("PI", 'PI'), ("PD", 'PD'), ("PID", 'PID'),
+                      ("实际PID", '实际PID'), ("重置", 'reset')]:
             tk.Button(presetf, text=t, command=lambda v=v: self.set_preset(v),
                      font=('Microsoft YaHei UI', 9), bg='#f1f5f9', fg='#334155',
                      activebackground=COLOR_PRIMARY, activeforeground='white',
@@ -217,9 +219,17 @@ class PidTunerApp:
         tk.Label(tunef, text="规律:", bg='#ffffff', font=('Microsoft YaHei UI', 9)).grid(
             row=1, column=0, sticky='e', padx=(0, 4))
         law_cb = ttk.Combobox(tunef, textvariable=self.control_law, width=6,
-                              values=['P', 'PI', 'PID'], state='readonly')
+                              values=['P', 'PI', 'PID', '实际PID'], state='readonly')
         law_cb.grid(row=1, column=1, pady=2)
         law_cb.bind('<<ComboboxSelected>>', lambda e: self.on_method_change())
+
+        # 实际PID滤波参数 (仅选择"实际PID"时显示)
+        self.tf_frame = tk.Frame(tunef, bg='#ffffff')
+        tk.Label(self.tf_frame, text="Tf:", bg='#ffffff',
+                font=('Microsoft YaHei UI', 9)).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Entry(self.tf_frame, textvariable=self.Tf, width=6).pack(side=tk.LEFT)
+        tk.Label(self.tf_frame, text="s", bg='#ffffff',
+                font=('Microsoft YaHei UI', 8), fg=COLOR_MUTED).pack(side=tk.LEFT, padx=(1, 0))
 
         # 临界比例带模式切换
         self.crit_mode_frame = tk.Frame(tunef, bg='#ffffff')
@@ -390,6 +400,14 @@ class PidTunerApp:
 
     def on_method_change(self):
         method = self.tuning_method.get()
+        law = self.control_law.get()
+
+        # 实际PID滤波参数显示/隐藏
+        if law == '实际PID':
+            self.tf_frame.grid(row=2, column=0, columnspan=3, pady=2, sticky='w')
+        else:
+            self.tf_frame.grid_remove()
+
         if method == '临界比例带法':
             self.crit_mode_frame.grid()
             self._update_crit_ui()
@@ -451,11 +469,14 @@ class PidTunerApp:
             'PI':    {'Kp': 1.50, 'Ki': 0.50, 'Kd': 0.00, 'law': 'PI'},
             'PD':    {'Kp': 2.00, 'Ki': 0.00, 'Kd': 0.50, 'law': 'PID'},
             'PID':   {'Kp': 2.00, 'Ki': 1.00, 'Kd': 0.50, 'law': 'PID'},
-            'reset': {'Kp': 1.00, 'Ki': 0.00, 'Kd': 0.00, 'law': None},
+            '实际PID': {'Kp': 2.00, 'Ki': 1.00, 'Kd': 0.50, 'Tf': 0.10, 'law': '实际PID'},
+            'reset': {'Kp': 1.00, 'Ki': 0.00, 'Kd': 0.00, 'Tf': 0.10, 'law': None},
         }
         if preset_type in presets:
             p = presets[preset_type]
             self.Kp.set(p['Kp']); self.Ki.set(p['Ki']); self.Kd.set(p['Kd'])
+            if 'Tf' in p:
+                self.Tf.set(p['Tf'])
             if p['law'] is not None:
                 self.control_law.set(p['law'])
             self.stop_animation()
@@ -471,6 +492,10 @@ class PidTunerApp:
         K = self.plant_K.get()
         T = self.plant_T.get()
         tau = self.plant_tau.get()
+
+        # 实际PID 的整定公式与理想 PID 相同 (仅微分滤波实现不同)
+        if law == '实际PID':
+            law = 'PID'
 
         if method == '手动经验法':
             return
@@ -745,6 +770,15 @@ class PidTunerApp:
                 pid_cfg = PIDConfig(Kp=Kp, Ki=Ki, Kd=Kd)  # 仅用于兼容
                 result = simulate(plant_cfg, pid_cfg, sim_cfg, controller=ctrl)
                 self._fuzzy_active = True
+            # 实际 PID 模式: 微分含惯性滤波
+            elif self.control_law.get() == '实际PID':
+                ctrl = RealPIDController(
+                    Kp=Kp, Ki=Ki, Kd=Kd, Tf=self.Tf.get(), dt=0.01,
+                    output_min=self.output_min.get(),
+                    output_max=self.output_max.get())
+                pid_cfg = PIDConfig(Kp=Kp, Ki=Ki, Kd=Kd)
+                result = simulate(plant_cfg, pid_cfg, sim_cfg, controller=ctrl)
+                self._fuzzy_active = False
             else:
                 pid_cfg = PIDConfig(Kp=Kp, Ki=Ki, Kd=Kd,
                                     output_min=self.output_min.get(),

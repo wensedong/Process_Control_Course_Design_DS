@@ -159,6 +159,89 @@ class PIDController:
 
 
 # ============================================================
+# 实际 PID 控制器 (微分项含一阶惯性滤波)
+# ============================================================
+
+class RealPIDController:
+    """
+    实际PID控制器 — 微分通道串联一阶低通滤波器。
+
+    理想PID的微分项为纯微分 Kd·s，对高频测量噪声无限放大。
+    实际工业PID在微分通道加入惯性环节:
+
+        D(s) = Kd·s / (1 + Tf·s)
+
+    其中 Tf 为滤波时间常数 (默认 0.1s)。Tf 越大，微分作用越平滑，
+    但相位滞后也越大。Tf=0 时退化为理想 PID。
+
+    离散化 (后向欧拉):
+
+        D_raw(k) = Kd · (-(pv(k) - pv(k-1)) / dt)
+        α = Tf / (Tf + dt)
+        D_filtered(k) = α · D_filtered(k-1) + (1-α) · D_raw(k)
+
+    其余逻辑 (比例项、条件积分抗饱和、对PV微分) 与 PIDController 一致。
+    """
+
+    def __init__(self, Kp=1.0, Ki=0.0, Kd=0.0, Tf=0.1, dt=0.01,
+                 output_min=-1e6, output_max=1e6):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        self.Tf = max(Tf, 0.0)     # 滤波时间常数 (s), 允许 0 退化为理想 PID
+        self.dt = dt
+        self.output_min = output_min
+        self.output_max = output_max
+        self.reset()
+
+    def reset(self):
+        self.integral = 0.0
+        self.prev_pv = 0.0
+        self.first_run = True
+        self.filtered_D = 0.0
+
+    def compute(self, setpoint, pv):
+        """计算控制量输出 (微分含惯性滤波, 带抗积分饱和)"""
+        error = setpoint - pv
+
+        # 比例
+        P = self.Kp * error
+
+        # 微分 (对PV微分 + 一阶低通滤波)
+        if self.first_run:
+            raw_D = 0.0
+            self.first_run = False
+        else:
+            raw_D = self.Kd * (-(pv - self.prev_pv) / self.dt)
+
+        # 一阶低通滤波 (后向欧拉离散)
+        if self.Tf > 1e-9:
+            alpha = self.Tf / (self.Tf + self.dt)
+            self.filtered_D = alpha * self.filtered_D + (1.0 - alpha) * raw_D
+        else:
+            self.filtered_D = raw_D   # Tf=0 → 退化为理想微分
+
+        D = self.filtered_D
+
+        # 积分 (条件积分 — 抗饱和)
+        candidate_integral = self.integral + error * self.dt
+        raw_output = P + self.Ki * candidate_integral + D
+
+        output = max(self.output_min, min(self.output_max, raw_output))
+
+        if output == raw_output or (
+            output == self.output_max and error < 0
+        ) or (
+            output == self.output_min and error > 0
+        ):
+            self.integral = candidate_integral
+
+        self.prev_pv = pv
+        output = P + self.Ki * self.integral + D
+        return max(self.output_min, min(self.output_max, output))
+
+
+# ============================================================
 # 闭环仿真
 # ============================================================
 
