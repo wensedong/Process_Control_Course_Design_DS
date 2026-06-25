@@ -28,6 +28,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import os
 import csv
+from datetime import datetime
 
 from simulation import Plant, simulate, PlantConfig, PIDConfig, SimulationConfig, RealPIDController
 from metrics import compute_metrics
@@ -123,9 +124,14 @@ class PidTunerApp:
         self._anim_frame = 0
         self._anim_speed = tk.IntVar(value=5)
 
+        # 曲线切换开关
+        self.show_plant_ol = tk.BooleanVar(value=False)    # 被控对象开环阶跃响应
+        self.show_pid_err = tk.BooleanVar(value=False)    # PID误差/响应曲线
+
         # 仿真缓存
         self._t = self._sp = self._pv = self._co = self._error = None
         self._metrics = None
+        self._plant_ol_pv = None   # 被控对象开环阶跃响应缓存
         self._stable = True
 
         self.build_ui()
@@ -159,6 +165,33 @@ class PidTunerApp:
                       command=lambda e: self.on_slider_change()).grid(row=i, column=1)
             ttk.Entry(plant, textvariable=var, width=5).grid(row=i, column=2, padx=(3, 0))
 
+        # 传递函数显示标签
+        self.plant_tf_label = tk.Label(plant, text='', bg='#ffffff',
+            font=('Consolas', 9), fg='#b45309',
+            anchor='w', justify='left')
+        self.plant_tf_label.grid(row=3, column=0, columnspan=3, sticky='ew', padx=2, pady=(2, 0))
+        self._update_transfer_function_label()
+
+        # 被控对象阶跃响应切换按钮 + 保存按钮
+        plant_btn_row = tk.Frame(plant, bg='#ffffff')
+        plant_btn_row.grid(row=4, column=0, columnspan=3, pady=(4, 1))
+        self.btn_plant_response = tk.Button(plant_btn_row, text="显示对象阶跃响应",
+            command=self.toggle_plant_response,
+            font=('Microsoft YaHei UI', 8), bg='#e0e7ff', fg=COLOR_PRIMARY,
+            activebackground=COLOR_PRIMARY, activeforeground='white',
+            relief='flat', padx=6, pady=1, cursor='hand2')
+        self.btn_plant_response.pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(plant_btn_row, text="▾ CSV",
+            command=self.save_plant_response,
+            font=('Microsoft YaHei UI', 8), bg='#f1f5f9', fg=COLOR_MUTED,
+            activebackground=COLOR_PRIMARY, activeforeground='white',
+            relief='flat', padx=5, pady=1, cursor='hand2').pack(side=tk.LEFT, padx=(0, 2))
+        tk.Button(plant_btn_row, text="▾ PNG",
+            command=self.save_plant_response_png,
+            font=('Microsoft YaHei UI', 8), bg='#f1f5f9', fg=COLOR_MUTED,
+            activebackground=COLOR_PRIMARY, activeforeground='white',
+            relief='flat', padx=5, pady=1, cursor='hand2').pack(side=tk.LEFT)
+
         # --- PID参数 ---
         pidf = tk.LabelFrame(ctrl, text=" PID 参数 ", font=('Microsoft YaHei UI', 9),
                              fg='#334155', bg='#ffffff', padx=6, pady=4)
@@ -175,6 +208,14 @@ class PidTunerApp:
                       orient=tk.HORIZONTAL, length=150,
                       command=lambda e: self.on_slider_change()).grid(row=i, column=1)
             ttk.Entry(pidf, textvariable=var, width=5).grid(row=i, column=2, padx=(3, 0))
+
+        # PID阶跃响应切换按钮
+        self.btn_pid_response = tk.Button(pidf, text="显示PID响应",
+            command=self.toggle_pid_response,
+            font=('Microsoft YaHei UI', 8), bg='#e0e7ff', fg=COLOR_PRIMARY,
+            activebackground=COLOR_PRIMARY, activeforeground='white',
+            relief='flat', padx=6, pady=1, cursor='hand2')
+        self.btn_pid_response.grid(row=3, column=0, columnspan=3, pady=(4, 1))
 
         # --- 仿真设置 ---
         simf = tk.LabelFrame(ctrl, text=" 仿真设置 ", font=('Microsoft YaHei UI', 9),
@@ -800,6 +841,11 @@ class PidTunerApp:
 
             self._metrics = compute_metrics(self._t, self._sp, self._pv, self._error)
 
+            # 若被控对象曲线开关打开, 同步刷新开环响应
+            if self.show_plant_ol.get():
+                self._compute_plant_openloop()
+
+            self._update_transfer_function_label()
             self._draw_static()
             self._update_metrics()
             self._update_status()
@@ -829,6 +875,17 @@ class PidTunerApp:
         ax1.set_ylabel('输出 y(t)', fontsize=9)
         title = '模糊PID控制阶跃响应曲线' if fuzzy else 'PID控制阶跃响应曲线'
         ax1.set_title(title, fontsize=12, fontweight='bold', color='#1e293b')
+        # 被控对象开环阶跃响应 (虚线叠加)
+        if self.show_plant_ol.get() and self._plant_ol_pv is not None:
+            ax1.plot(t[:len(self._plant_ol_pv)], self._plant_ol_pv,
+                     '#059669', lw=1.8, ls='--', alpha=0.7,
+                     label='被控对象开环响应 G(s)')
+
+        # PID误差响应曲线 (点划线叠加)
+        if self.show_pid_err.get() and self._error is not None:
+            ax1.plot(t, self._error, '#ea580c', lw=1.5, ls='-.', alpha=0.7,
+                     label='误差 e(t)')
+
         ax1.legend(loc='lower right', fontsize=8, framealpha=0.9)
         ax1.grid(True, alpha=0.3, color='#cbd5e1')
         ax1.set_xlim(0, sim_t)
@@ -837,16 +894,6 @@ class PidTunerApp:
                         lw=0.6, ls=':', alpha=0.5)
         ax1.axhline(sp[0], color=COLOR_SUCCESS, lw=0.6, ls=':', alpha=0.3)
 
-        # 传递函数分式标注
-        pk, pT, ptau = self.plant_K.get(), self.plant_T.get(), self.plant_tau.get()
-        if ptau > 0:
-            tf_str = r'$G(s)=\frac{%.2f\ e^{-%.2fs}}{%.2fs+1}$' % (pk, ptau, pT)
-        else:
-            tf_str = r'$G(s)=\frac{%.2f}{%.2fs+1}$' % (pk, pT)
-        ax1.text(0.02, 0.97, tf_str, transform=ax1.transAxes, fontsize=10,
-                 verticalalignment='top',
-                 bbox=dict(boxstyle='round,pad=0.3', facecolor='#fffbeb',
-                           edgecolor='#d97706', alpha=0.9))
 
         if fuzzy:
             # 控制量子图
@@ -885,6 +932,155 @@ class PidTunerApp:
 
         self.fig.tight_layout()
         self.canvas.draw()
+
+    # ==================================================================
+    # 曲线切换: 被控对象开环阶跃响应 / PID误差响应
+    # ==================================================================
+
+    def _update_transfer_function_label(self):
+        """更新被控对象传递函数显示标签"""
+        K, T, tau = self.plant_K.get(), self.plant_T.get(), self.plant_tau.get()
+        if tau > 0:
+            tf_str = 'G(s) = {:.2f} · e^(-{:.2f}s) / ({:.2f}s + 1)'.format(K, tau, T)
+        else:
+            tf_str = 'G(s) = {:.2f} / ({:.2f}s + 1)'.format(K, T)
+        self.plant_tf_label.config(text=tf_str)
+
+    def toggle_plant_response(self):
+        """切换被控对象开环阶跃响应曲线的显示"""
+        self.show_plant_ol.set(not self.show_plant_ol.get())
+        if self.show_plant_ol.get():
+            self.btn_plant_response.config(
+                text="隐藏对象阶跃响应", bg=COLOR_PRIMARY, fg='white')
+        else:
+            self.btn_plant_response.config(
+                text="显示对象阶跃响应", bg='#e0e7ff', fg=COLOR_PRIMARY)
+        self._compute_plant_openloop()
+        self.update_plot()
+
+    def toggle_pid_response(self):
+        """切换PID误差响应曲线的显示"""
+        self.show_pid_err.set(not self.show_pid_err.get())
+        if self.show_pid_err.get():
+            self.btn_pid_response.config(
+                text="隐藏PID响应", bg=COLOR_PRIMARY, fg='white')
+        else:
+            self.btn_pid_response.config(
+                text="显示PID响应", bg='#e0e7ff', fg=COLOR_PRIMARY)
+        self.update_plot()
+
+    def _compute_plant_openloop(self):
+        """计算被控对象的开环阶跃响应 (无控制器, u=SP 阶跃)"""
+        if not self.show_plant_ol.get():
+            self._plant_ol_pv = None
+            return
+        try:
+            from simulation import Plant
+            K = self.plant_K.get()
+            T = self.plant_T.get()
+            tau = self.plant_tau.get()
+            sp = self.setpoint.get()
+            sim_t = self.sim_time.get()
+            dt = 0.01
+            n = int(sim_t / dt)
+            plant_obj = Plant(K=K, T=T, tau=tau, dt=dt)
+            t_arr = np.linspace(0, sim_t, n)
+            pv_arr = np.zeros(n)
+            for i in range(1, n):
+                pv_arr[i] = plant_obj.step(sp)  # 单位阶跃输入 u=SP
+            self._plant_ol_pv = pv_arr
+        except Exception:
+            self._plant_ol_pv = None
+
+    def save_plant_response(self):
+        """保存被控对象开环阶跃响应数据到 CSV"""
+        # 即时计算当前对象参数下的开环响应
+        try:
+            from simulation import Plant
+            K = self.plant_K.get()
+            T = self.plant_T.get()
+            tau = self.plant_tau.get()
+            sp = self.setpoint.get()
+            sim_t = self.sim_time.get()
+            dt = 0.01
+            n = int(sim_t / dt)
+            plant_obj = Plant(K=K, T=T, tau=tau, dt=dt)
+            t_arr = np.linspace(0, sim_t, n)
+            pv_arr = np.zeros(n)
+            u_arr = np.full(n, sp)
+            for i in range(1, n):
+                pv_arr[i] = plant_obj.step(sp)
+
+            d = _get_default_dir()
+            path = filedialog.asksaveasfilename(
+                initialdir=d,
+                initialfile=f"plant_step_{_timestamp()}.csv",
+                defaultextension=".csv",
+                filetypes=[("CSV", "*.csv")])
+            if not path:
+                return
+
+            with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                w = csv.writer(f)
+                w.writerow(['# 被控对象开环阶跃响应数据'])
+                w.writerow(['# 时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+                w.writerow(['# 模型', f'G(s)=K*e^(-tau*s)/(Ts+1)'])
+                w.writerow(['# 参数', f'K={K}, T={T}, tau={tau}'])
+                w.writerow(['# 输入', f'阶跃 u={sp}'])
+                w.writerow(['#'])
+                w.writerow(['Time(s)', 'Input', 'Output'])
+                for i in range(n):
+                    w.writerow([f'{t_arr[i]:.6f}', f'{u_arr[i]:.6f}', f'{pv_arr[i]:.6f}'])
+            messagebox.showinfo("OK", f"已保存:\n{path}")
+        except Exception as e:
+            messagebox.showerror("保存失败", str(e))
+
+    def save_plant_response_png(self):
+        """保存被控对象开环阶跃响应曲线为 PNG"""
+        try:
+            from simulation import Plant
+            K = self.plant_K.get()
+            T = self.plant_T.get()
+            tau = self.plant_tau.get()
+            sp = self.setpoint.get()
+            sim_t = self.sim_time.get()
+            dt = 0.01
+            n = int(sim_t / dt)
+            plant_obj = Plant(K=K, T=T, tau=tau, dt=dt)
+            t_arr = np.linspace(0, sim_t, n)
+            pv_arr = np.zeros(n)
+            for i in range(1, n):
+                pv_arr[i] = plant_obj.step(sp)
+
+            d = _get_default_dir()
+            path = filedialog.asksaveasfilename(
+                initialdir=d,
+                initialfile=f"plant_step_{_timestamp()}.png",
+                defaultextension=".png",
+                filetypes=[("PNG", "*.png")])
+            if not path:
+                return
+
+            # 单独绘制被控对象开环阶跃响应
+            fig = Figure(figsize=(7, 3.5), dpi=150, facecolor='white')
+            ax = fig.add_subplot(111)
+            ax.set_facecolor('white')
+            ax.plot(t_arr, pv_arr, '#059669', lw=2.0, label=f'开环响应 G(s)')
+            ax.axhline(sp, color='gray', lw=0.6, ls=':', alpha=0.5, label=f'输入 u={sp}')
+            ax.set_xlabel('时间 t (s)', fontsize=9)
+            ax.set_ylabel('输出 y(t)', fontsize=9)
+            ax.set_title(f'被控对象开环阶跃响应 (K={K}, T={T}, τ={tau})',
+                        fontsize=11, fontweight='bold')
+            ax.legend(loc='lower right', fontsize=8)
+            ax.grid(True, alpha=0.3, color='#cbd5e1')
+            ax.set_xlim(0, sim_t)
+
+            fig.tight_layout()
+            save_figure(fig, path, 'png')
+            plt.close(fig)
+            messagebox.showinfo("OK", f"已保存:\n{path}")
+        except Exception as e:
+            messagebox.showerror("保存失败", str(e))
 
     def _update_status(self):
         if not self._stable:
@@ -946,6 +1142,20 @@ class PidTunerApp:
                  label=f'SP={self.setpoint.get()}')
         ax1.plot(t[:end+1], pv[:end+1], COLOR_PRIMARY, lw=2.0,
                  label=f'PV (Kp={Kp:.2f} Ki={Ki:.2f} Kd={Kd:.2f})')
+
+        # 被控对象开环阶跃响应 (叠加)
+        if self.show_plant_ol.get() and self._plant_ol_pv is not None:
+            n_ol = min(end+1, len(self._plant_ol_pv))
+            ax1.plot(t[:n_ol], self._plant_ol_pv[:n_ol],
+                     '#059669', lw=1.8, ls='--', alpha=0.7,
+                     label='被控对象开环响应 G(s)')
+
+        # PID误差响应曲线 (叠加)
+        if self.show_pid_err.get() and self._error is not None:
+            ax1.plot(t[:end+1], self._error[:end+1],
+                     '#ea580c', lw=1.5, ls='-.', alpha=0.7,
+                     label='误差 e(t)')
+
         ax1.set_ylabel('输出 y(t)', fontsize=9)
         ax1.set_title(f'动画播放中 ({t[end]:.1f}s / {sim_t:.0f}s)',
                       fontsize=12, fontweight='bold', color='#1e293b')
